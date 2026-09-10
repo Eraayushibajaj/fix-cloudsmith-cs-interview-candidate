@@ -1,0 +1,120 @@
+name: Promote Python Package
+
+# This pipeline is no longer triggered manually. Instead, Cloudsmith calls
+# the GitHub "repository_dispatch" API directly from a repository webhook
+# as soon as a package has finished synchronising in the staging repository.
+#
+# Webhook setup (configured on the Cloudsmith "staging" repository, not in
+# this file):
+#   1. In the staging repository, go to Settings -> Webhooks -> Add Webhook.
+#   2. Event: "Package Synchronised".
+#   3. Payload URL: https://api.github.com/repos/<owner>/<repo>/dispatches
+#   4. Payload Format: Handlebars Template, Content-Type: application/json.
+#   5. Headers:
+#        Authorization: Bearer <fine-grained PAT with "contents: write">
+#        Accept: application/vnd.github+json
+#   6. Body (maps Cloudsmith's package-synchronised payload onto the
+#      GitHub repository_dispatch schema; event_type must match the
+#      "types" filter below):
+#        {
+#          "event_type": "package-synchronised",
+#          "client_payload": {
+#            "namespace": "{{ data.namespace }}",
+#            "repository": "{{ data.repository }}",
+#            "filename": "{{ data.filename }}",
+#            "version": "{{ data.version }}",
+#            "identifier_perm": "{{ data.identifier_perm }}"
+#          }
+#        }
+#   7. (Optional but recommended) attach a package search query to the
+#      webhook, e.g. "format:python", so only Python package syncs fire it.
+#
+# GitHub only accepts repository_dispatch calls authenticated with a token
+# that has write access to the repo, so the PAT above is stored as a
+# Cloudsmith webhook secret/header, not as a GitHub secret.
+
+on:
+  repository_dispatch:
+    types: [package-synchronised]
+
+env:
+  CLOUDSMITH_NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+  CLOUDSMITH_STAGING_REPO: 'staging'
+  CLOUDSMITH_PRODUCTION_REPO: 'production'
+  CLOUDSMITH_SERVICE_SLUG: ${{ vars.CLOUDSMITH_SERVICE_SLUG }}
+  PACKAGE_NAME: 'example_package'
+  READY_TAG: 'ready-for-production'
+
+permissions:
+  id-token: write
+
+jobs:
+  tag-ready-for-production:
+    # Step 1: a package has just synchronised in staging (per the webhook
+    # payload). Tag it so it enters the promotion queue. Tagging is kept
+    # separate from promoting so the "what's eligible for prod" state lives
+    # entirely on the package itself (via its tag) and can be inspected,
+    # re-run, or audited independently of any one workflow run.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Cloudsmith CLI
+        uses: cloudsmith-io/cloudsmith-cli-action@v1.0.1
+        with:
+          oidc-namespace: ${{ env.CLOUDSMITH_NAMESPACE }}
+          oidc-service-slug: ${{ env.CLOUDSMITH_SERVICE_SLUG }}
+
+      - name: Tag synchronised package as ready-for-production
+        env:
+          IDENTIFIER: ${{ github.event.client_payload.identifier_perm }}
+          FILENAME: ${{ github.event.client_payload.filename }}
+        run: |
+          if [ -z "$IDENTIFIER" ] || [ "$IDENTIFIER" = "null" ]; then
+            echo "No package identifier in webhook payload for $FILENAME"
+            exit 1
+          fi
+
+          echo "Tagging $FILENAME ($IDENTIFIER) as ${READY_TAG}"
+          cloudsmith tags add \
+            "${CLOUDSMITH_NAMESPACE}/${CLOUDSMITH_STAGING_REPO}/${IDENTIFIER}" \
+            "${READY_TAG}"
+        shell: bash
+
+  promote:
+    # Step 2: promote every package in staging currently tagged
+    # ready-for-production. Runs after tagging so this run always sees its
+    # own package, but the query itself is not scoped to a single package -
+    # it will also sweep up any previously tagged package that a prior run
+    # failed to promote.
+    needs: tag-ready-for-production
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install Cloudsmith CLI
+        uses: cloudsmith-io/cloudsmith-cli-action@v1.0.1
+        with:
+          oidc-namespace: ${{ env.CLOUDSMITH_NAMESPACE }}
+          oidc-service-slug: ${{ env.CLOUDSMITH_SERVICE_SLUG }}
+
+      - name: Get ready-for-production packages and promote
+        run: |
+          # Query staging for every package tagged ready-for-production,
+          # rather than a single filename/version, so any package that
+          # reaches that state (from this run or a previous one) is promoted.
+          PACKAGE_QUERY="tag:${READY_TAG}"
+          echo "Searching for packages with query: $PACKAGE_QUERY"
+
+          PACKAGE_DATA=$(cloudsmith list package "${CLOUDSMITH_NAMESPACE}/${CLOUDSMITH_STAGING_REPO}" -q "$PACKAGE_QUERY" -F json)
+
+          COUNT=$(echo "$PACKAGE_DATA" | jq '.data | length')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No packages tagged ${READY_TAG} were found"
+            exit 1
+          fi
+
+          echo "$PACKAGE_DATA" | jq -r '.data[].identifier_perm' | while read -r IDENTIFIER; do
+            echo "Promoting package identifier: $IDENTIFIER"
+            cloudsmith mv --yes \
+              "${CLOUDSMITH_NAMESPACE}/${CLOUDSMITH_STAGING_REPO}/${IDENTIFIER}" \
+              "${CLOUDSMITH_PRODUCTION_REPO}"
+          done
+        shell: bash
